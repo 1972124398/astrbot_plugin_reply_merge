@@ -64,6 +64,7 @@ import random
 import re
 import time
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass
 
 from astrbot.api import AstrBotConfig, logger
@@ -177,6 +178,11 @@ ORPHAN_GRACE_SECONDS = 5.0
 # Parked windows older than this are dropped when the next window opens,
 # bounding memory for chats that never come back.
 ORPHAN_MAX_AGE_SECONDS = 600.0
+# Child tasks inherit this context, including tools which run inside their own
+# tasks. They must not unload the plugin whose pipeline is waiting for them.
+_MERGE_TASK: ContextVar[asyncio.Task | None] = ContextVar(
+    "reply_merge_task", default=None
+)
 
 # Follow-up components we cannot forward to the merged request; only a
 # placeholder line is folded into the buffer so the persona model (and the
@@ -356,6 +362,21 @@ def parse_verdict(
     return "", points, summary, questions, action, wait
 
 
+@dataclass
+class BufferedMessage:
+    """One message with its arrival order, rendered text and attached images.
+
+    Attributes:
+        order: Platform arrival key, with an observation counter as tie breaker.
+        lines: Rendered text and attachment placeholders belonging to this message.
+        images: Image references belonging to the same message.
+    """
+
+    order: tuple[int, int, int]
+    lines: list[str]
+    images: list[str]
+
+
 class MergeWindow:
     """Buffered state of one open sliding window."""
 
@@ -370,69 +391,32 @@ class MergeWindow:
         """Create a window whose first quiet period is already running.
 
         Args:
-            quiet_seconds: Initial quiet period from now, used as the
-                fallback before the first thought pass runs.
-            max_window: Total window lifetime cap from now; thought
-                verdicts may never push the deadline past it.
-            first_message: The leader's own text; the thought passes and
-                the archived chain use it as the message the follow-ups
-                answered.
-            leader_order: Arrival key of the leader's own message. Two
-                messages can reach the waiting hook out of order when the
-                earlier one takes a slower path (image download, typing
-                round-trip), so a donation with a lower key was actually
-                sent before the leader and must be rendered ahead of it.
-            leader_images: Images the leader itself sent, so thought
-                passes can look at them instead of only a placeholder.
+            quiet_seconds: Initial fallback quiet period in seconds.
+            max_window: Total window lifetime before the final reading grace.
+            first_message: The leader's text or attachment outline.
+            leader_order: Arrival key used to restore actual sending order.
+            leader_images: Images already attached to the leader's host request.
         """
         self.first_message = first_message
         self.leader_order = leader_order
-        # Kept apart from `images` (which merge_tail forwards to the reply)
-        # because the reply already receives these from the host request;
-        # they exist only so the thought passes can see the actual picture.
-        self.leader_images = leader_images or []
-        # (arrival_key, rendered lines), so the merged prompt can be put
-        # back into the user's real sending order without losing message
-        # boundaries when max_followups truncates the buffer.
-        self.buffer: list[tuple[tuple[int, int, int], list[str]]] = []
-        self.images: list[str] = []
-        # Follow-ups rescued from a window whose request never reached the
-        # model: they are older than first_message, so they get their own
-        # block instead of being mislabelled as later follow-ups. The lines
-        # carry no grouping, so earlier_count keeps the true message count.
-        self.earlier: list[str] = []
-        self.earlier_count = 0
-        self.earlier_images: list[str] = []
-        # Set when a newer window has taken this window's content over; a
-        # request still queued for this window must then not answer again.
+        self.leader_images = list(leader_images or [])
+        self.buffer: list[BufferedMessage] = []
+        self.earlier: list[BufferedMessage] = []
         self.rescued = False
-        # Messages donated since the last thought pass that actually read
-        # them. Lazy evaluation lets a few follow-ups pile up and only
-        # thinks once at the deadline instead of once per message.
         self.unseen = 0
-        # Why the leader loop exited ("quiet" or "hard_cap"); merge_tail
-        # tells the persona when the burst was cut off at the time cap.
         self.close_reason = ""
         self.thoughts: list[Verdict] = []
         self.waits: list[float] = []
-        # How many of all_images() the thought passes have already been
-        # handed, so one picture is not re-billed on every pass.
-        self.think_images_sent = 0
-        # Cached history transcript for the thought passes; None means it has
-        # not been read yet, "" means there was nothing to add.
+        # Track references rather than offsets: late arrivals can sort before
+        # images already sent to a thought pass.
+        self.think_images_seen: set[str] = set()
         self.context_block: str | None = None
         now = time.monotonic()
         self.started_at = now
-        # Anchor of the guaranteed quiet floor: min_wait counts from the
-        # user's LATEST message, so every donation re-arms it.
         self.last_activity = now
         self.hard_cap = now + max(1.0, max_window)
         self.deadline = min(self.hard_cap, now + quiet_seconds)
-        # Per-window nonce so users cannot forge the injection markers
-        # in their messages.
         self.nonce = uuid.uuid4().hex[:8]
-        # Starts set so the leader immediately thinks about its own first
-        # message; every donation sets it again to wake the leader.
         self.wakeup = asyncio.Event()
         self.wakeup.set()
 
@@ -443,80 +427,85 @@ class MergeWindow:
         images: list[str],
         extras: list[str],
     ) -> None:
-        """Fold one follow-up message into the buffer and wake the leader.
+        """Keep a follow-up's text and images together and wake the leader.
 
         Args:
-            order: Arrival key of this message, used to restore the user's
-                real sending order in the merged prompt.
-            text: Stripped plain text of the message, "" for image-only.
-            images: Image URLs/file paths from the message chain.
-            extras: Placeholder labels for attachments that cannot be
-                forwarded (voice, video, file, forward), so the merged
-                reply at least knows they were sent instead of silently
-                swallowing them.
+            order: Arrival key used to restore sending order.
+            text: Plain text or attachment outline, empty for image-only input.
+            images: Image URLs or file paths belonging to this message.
+            extras: Labels for unsupported attachments.
         """
-        lines: list[str] = []
-        if text:
-            lines.append(f"- {text}")
-        if images:
-            self.images.extend(images)
-            if not text:
-                lines.append("- [图片/表情包]")
-        for label in extras:
-            lines.append(f"- [{label}]")
+        lines = [f"- {text}"] if text else []
+        if images and not text:
+            lines.append("- [图片/表情包]")
+        lines.extend(f"- [{label}]" for label in extras)
         if lines:
-            self.buffer.append((order, lines))
+            self.buffer.append(BufferedMessage(order, lines, list(images)))
             self.unseen += 1
         self.last_activity = time.monotonic()
         self.wakeup.set()
 
-    def all_images(self, include_followups: bool = True) -> list[str]:
-        """List every image this window has collected, without duplicates.
+    def all_messages(self) -> list[BufferedMessage]:
+        """Return every message, including the leader, in sending order.
 
-        The order is the user's sending order: images rescued from an older
-        window first, then the leader's own, then follow-ups. Deduplication
-        keeps a sticker sent twice from being read (and billed) twice.
+        Returns:
+            A new ordered list whose entries preserve text/image ownership.
+        """
+        leader = BufferedMessage(
+            self.leader_order,
+            [f"- {self.first_message}"] if self.first_message else [],
+            self.leader_images,
+        )
+        return sorted(
+            [*self.earlier, leader, *self.buffer], key=lambda message: message.order
+        )
+
+    def all_images(self, include_followups: bool = True) -> list[str]:
+        """Return unique image references in message sending order.
 
         Args:
-            include_followups: Whether follow-up images are included. The
-                reply only forwards those when forward_images is on, so the
-                thought passes follow the same rule and do not pay for
-                pictures the answer will never see.
+            include_followups: Include donated and rescued images when forwarding
+                is enabled; otherwise include only the leader's own images.
 
         Returns:
-            Image URLs or local paths in sending order.
+            Image references with duplicates removed, preserving order.
         """
-        sources: list[str] = [*self.leader_images]
-        if include_followups:
-            sources = [*self.earlier_images, *sources, *self.images]
-        ordered: list[str] = []
-        seen: set[str] = set()
-        for src in sources:
-            if src and src not in seen:
-                seen.add(src)
-                ordered.append(src)
-        return ordered
+        sources = (
+            [image for message in self.all_messages() for image in message.images]
+            if include_followups
+            else self.leader_images
+        )
+        return list(dict.fromkeys(image for image in sources if image))
 
-    def ordered_messages(self) -> tuple[list[str], list[list[str]]]:
-        """Split buffered follow-up messages into before/after the leader.
+    def ordered_messages(
+        self,
+    ) -> tuple[list[BufferedMessage], list[BufferedMessage]]:
+        """Split donated messages before and after the leader.
 
         Returns:
-            (before, after): rendered lines sent before the leader's own
-            message, and grouped lines sent after it, each in arrival
-            order. `after` keeps one entry per message so truncation can
-            drop whole messages instead of cutting one in half. `before`
-            is only non-empty when a slower pipeline let a later message
-            open the window first.
+            Two lists in sending order; each entry keeps a whole message and
+            its images together when the reply applies max_followups.
         """
-        ordered = sorted(self.buffer, key=lambda item: item[0])
-        before = [
-            line
-            for order, lines in ordered
-            if order < self.leader_order
-            for line in lines
-        ]
-        after = [lines for order, lines in ordered if order >= self.leader_order]
-        return before, after
+        ordered = sorted(self.buffer, key=lambda message: message.order)
+        return (
+            [message for message in ordered if message.order < self.leader_order],
+            [message for message in ordered if message.order >= self.leader_order],
+        )
+
+    def take_messages(self) -> list[BufferedMessage]:
+        """Move unanswered content out of a superseded window.
+
+        Returns:
+            All buffered messages in sending order. The old window is marked
+            rescued and emptied so it cannot answer the content again.
+        """
+        messages = self.all_messages()
+        self.rescued = True
+        self.first_message = ""
+        self.leader_images = []
+        self.earlier = []
+        self.buffer = []
+        return [message for message in messages if message.lines or message.images]
 
 
 class ReplyMergePlugin(Star):
@@ -554,6 +543,90 @@ class ReplyMergePlugin(Star):
         # merged prompt is ordered by it so a burst is never presented to
         # the model out of the order the user typed it.
         self._order = 0
+        self._closing = False
+        # Keep response hooks registered until accepted messages have completed
+        # their host pipelines. Cancelling those tasks would lose donated input.
+        self._leaders: set[asyncio.Task] = set()
+        # The Context outlives plugin module reloads. Transfer plain message data
+        # rather than old-class instances, and consume it once on reactivation.
+        handoff = getattr(context, "_reply_merge_handoff", None)
+        if isinstance(handoff, dict):
+            for key, entries in handoff.items():
+                for closed_at, messages in entries:
+                    if time.monotonic() - closed_at > ORPHAN_MAX_AGE_SECONDS:
+                        continue
+                    window = MergeWindow(0, 1)
+                    window.earlier = [
+                        BufferedMessage(tuple(order), list(lines), list(images))
+                        for order, lines, images in messages
+                    ]
+                    self._order = max(
+                        self._order,
+                        max(
+                            (message.order[2] for message in window.earlier), default=0
+                        ),
+                    )
+                    self.orphaned.setdefault(key, []).append((closed_at, window))
+            delattr(context, "_reply_merge_handoff")
+
+    async def terminate(self) -> None:
+        """Drain accepted requests before the host removes this plugin's hooks.
+
+        Raises:
+            asyncio.CancelledError: If a request tries to unload its own plugin.
+                The host swallows ordinary exceptions and would still unload it.
+        """
+        current = asyncio.current_task()
+        if current in self._leaders or _MERGE_TASK.get() in self._leaders:
+            logger.warning("[merge] cannot unload from an active merge request")
+            raise asyncio.CancelledError("Reload from a separate management request")
+        self._closing = True
+        for window in tuple(self.pending.values()):
+            window.wakeup.set()
+        tasks = [task for task in self._leaders if not task.done()]
+        if tasks:
+            logger.info(
+                f"[merge] draining {len(tasks)} accepted requests before unload"
+            )
+            # Shield host-owned tasks: cancelling a management request must not
+            # cancel the conversations it is waiting to drain.
+            try:
+                await asyncio.shield(asyncio.gather(*tasks, return_exceptions=True))
+            except asyncio.CancelledError:
+                # The host has not unregistered us yet. Resume normal operation
+                # if its management request is cancelled while draining.
+                self._closing = False
+                raise
+        # A provider selection failure or cancelled pipeline can finish without
+        # claiming its window. Keep its unanswered input for the next instance.
+        handoff = {}
+        now = time.monotonic()
+        for key, entries in self.orphaned.items():
+            for closed_at, window in entries:
+                if window.rescued or now - closed_at > ORPHAN_MAX_AGE_SECONDS:
+                    continue
+                messages = [
+                    (message.order, list(message.lines), list(message.images))
+                    for message in window.all_messages()
+                    if message.lines or message.images
+                ]
+                if messages:
+                    handoff.setdefault(key, []).append(
+                        (min(closed_at, now - ORPHAN_GRACE_SECONDS), messages)
+                    )
+        if handoff:
+            # Without a shared host context, refuse to silently throw input away.
+            if self.context is None:
+                self._closing = False
+                raise asyncio.CancelledError(
+                    "Cannot hand off unanswered merge messages"
+                )
+            self.context._reply_merge_handoff = handoff
+        self.pending.clear()
+        self.orphaned.clear()
+        self.inflight.clear()
+        self.stale.clear()
+        self.last_chain.clear()
 
     def _next_order(self) -> int:
         """Return the next arrival order.
@@ -742,9 +815,44 @@ class ReplyMergePlugin(Star):
                 text = "\n".join(parts)
             else:
                 text = ""
-            # Drop the merge blocks appended by earlier turns so the thinking
-            # does not read its own markers as user content.
-            text = text.split("[以下是")[0].strip()
+            if role == "user":
+                text = re.sub(
+                    r"\[reply_merge:thought:([0-9a-f]{8})\]\n.*?"
+                    r"\n\[/reply_merge:thought:\1\]",
+                    "",
+                    text,
+                    flags=re.DOTALL,
+                )
+                # Legacy thoughts have no end marker. Scan whole header lines
+                # once and stop skipping at the next header with the same nonce;
+                # avoid regex backtracking across malformed long user input.
+                kept: list[str] = []
+                thought_nonce = ""
+                for line in text.splitlines():
+                    header_nonce = ""
+                    if line.startswith("[以下是") and line.endswith("]"):
+                        match = re.search(r"（校验码 ([0-9a-f]{8})）", line)
+                        if match:
+                            header_nonce = match.group(1)
+                    if thought_nonce:
+                        if header_nonce != thought_nonce:
+                            continue
+                        thought_nonce = ""
+                    if (
+                        header_nonce
+                        and line.startswith("[以下是你在回复前对")
+                        and "内心思考" in line
+                    ):
+                        thought_nonce = header_nonce
+                        continue
+                    if header_nonce and line.startswith("[以下是这位用户"):
+                        continue
+                    if line.startswith("[这轮等待是到时长上限才收尾的，") and re.search(
+                        r"（校验码 [0-9a-f]{8}）\]$", line
+                    ):
+                        continue
+                    kept.append(line)
+                text = "\n".join(kept)
             # One line per turn: a multi-line reply must keep its speaker
             # label, otherwise its second line reads like narration and the
             # thinking can attribute its own words to the user.
@@ -774,6 +882,8 @@ class ReplyMergePlugin(Star):
             False when the chat type is out of usage_scope, or the session
             or the sender is blacklisted.
         """
+        if self._closing:
+            return False
         scope = str(self.config.get("usage_scope", "both") or "both").strip().lower()
         try:
             is_private = event.is_private_chat()
@@ -960,9 +1070,9 @@ class ReplyMergePlugin(Star):
                 if sees_images
                 else []
             )
-            think_images = images[
-                window.think_images_sent : window.think_images_sent + THINK_IMAGE_LIMIT
-            ]
+            think_images = [
+                image for image in images if image not in window.think_images_seen
+            ][:THINK_IMAGE_LIMIT]
             # The latest usable thought, skipping fallback passes so a single
             # failed call does not wipe the chain.
             previous = ""
@@ -980,14 +1090,18 @@ class ReplyMergePlugin(Star):
                     window.context_block = await self._history_block(event)
                 context_block = window.context_block
             before, after = window.ordered_messages()
-            after_lines = [line for message in after for line in message]
+            before_lines = [line for message in before for line in message.lines]
+            after_lines = [line for message in after for line in message.lines]
+            earlier_lines = [
+                line for message in window.earlier for line in message.lines
+            ]
             # A long burst must still be read to the end: the monologue
             # stays one or two lines, but it should answer the whole burst
             # instead of the first word that jumps out.
             content_chars = (
                 len(first_message)
-                + sum(len(line) for line in window.earlier)
-                + sum(len(line) for _, lines in window.buffer for line in lines)
+                + sum(len(line) for line in earlier_lines)
+                + sum(len(line) for message in window.buffer for line in message.lines)
             )
             long_burst = content_chars > THINK_LONG_CONTENT_CHARS
             # The window only ever holds one member's burst, but a group
@@ -1047,7 +1161,7 @@ class ReplyMergePlugin(Star):
                 lines = [
                     f"[窗口状态] 已等待 {elapsed:.0f} 秒；"
                     f"距强制收尾还剩 {max(0.0, remaining):.0f} 秒；"
-                    f"已收到 {1 + window.earlier_count + len(window.buffer)} 条消息",
+                    f"已收到 {1 + len(window.earlier) + len(window.buffer)} 条消息",
                 ]
                 if context_block:
                     if in_group:
@@ -1069,10 +1183,10 @@ class ReplyMergePlugin(Star):
                 )
             if think_images:
                 lines.append(image_note)
-            if window.earlier:
-                lines.append(earlier_label + "\n".join(window.earlier))
-            if before:
-                lines.append(before_label + "\n".join(before))
+            if earlier_lines:
+                lines.append(earlier_label + "\n".join(earlier_lines))
+            if before_lines:
+                lines.append(before_label + "\n".join(before_lines))
             lines.append(first_label + f"{first_message or '（无文字）'}")
             if after_lines:
                 lines.append(after_label + "\n".join(after_lines))
@@ -1144,7 +1258,7 @@ class ReplyMergePlugin(Star):
         # Only mark these pictures as seen once the pass actually produced a
         # verdict: a failed pass retries them instead of silently losing the
         # image from the rest of the chain.
-        window.think_images_sent += len(think_images)
+        window.think_images_seen.update(think_images)
         return Verdict(points, summary, questions, action, wait, thought)
 
     @filter.event_message_type(filter.EventMessageType.ALL)
@@ -1273,43 +1387,14 @@ class ReplyMergePlugin(Star):
             if now - ts < ORPHAN_GRACE_SECONDS:
                 still_waiting.append((ts, old))
                 continue
-            before, after = old.ordered_messages()
-            moved = before + [line for message in after for line in message]
-            if not (
-                moved
-                or old.earlier
-                or old.first_message
-                or old.images
-                or old.earlier_images
-                or old.leader_images
-            ):
+            moved = old.take_messages()
+            if not moved:
                 continue
-            # Anything rescued earlier is older than this window too, so it
-            # travels along instead of being left behind in a dead window.
-            # The dead leader's own message sits between its earlier block
-            # and its follow-ups, exactly where it was sent.
-            rescued_count = old.earlier_count + len(old.buffer)
-            window.earlier.extend(old.earlier)
-            if old.first_message:
-                window.earlier.append(f"- {old.first_message}")
-                rescued_count += 1
             window.earlier.extend(moved)
-            window.earlier_count += rescued_count
-            window.earlier_images.extend(old.earlier_images)
-            window.earlier_images.extend(old.leader_images)
-            window.earlier_images.extend(old.images)
             logger.warning(
-                f"[merge] moved {rescued_count} unanswered messages from a "
+                f"[merge] moved {len(moved)} unanswered messages from a "
                 f"window whose reply never started ({key})"
             )
-            old.rescued = True
-            old.first_message = ""
-            old.leader_images = []
-            old.earlier = []
-            old.earlier_count = 0
-            old.earlier_images = []
-            old.buffer = []
-            old.images = []
             old.thoughts = []
             old.waits = []
         if still_waiting:
@@ -1333,30 +1418,18 @@ class ReplyMergePlugin(Star):
         ):
             stale_window = inflight[0]
             self.stale.setdefault(key, set()).add(stale_window)
-            stale_count = stale_window.earlier_count + len(stale_window.buffer)
-            window.earlier.extend(stale_window.earlier)
-            if stale_window.first_message:
-                window.earlier.append(f"- {stale_window.first_message}")
-                stale_count += 1
-            stale_before, stale_after = stale_window.ordered_messages()
-            window.earlier.extend(stale_before)
-            window.earlier.extend(line for message in stale_after for line in message)
-            window.earlier_count += stale_count
-            window.earlier_images.extend(stale_window.earlier_images)
-            window.earlier_images.extend(stale_window.leader_images)
-            window.earlier_images.extend(stale_window.images)
-            stale_window.rescued = True
-            stale_window.first_message = ""
-            stale_window.leader_images = []
-            stale_window.earlier = []
-            stale_window.earlier_count = 0
-            stale_window.earlier_images = []
-            stale_window.buffer = []
-            stale_window.images = []
+            moved = stale_window.take_messages()
+            window.earlier.extend(moved)
+            stale_count = len(moved)
             logger.info(
                 f"[merge] in-flight reply goes stale; its {stale_count} "
                 f"messages ride with the new window ({key})"
             )
+        window.earlier.sort(key=lambda message: message.order)
+        task = asyncio.current_task()
+        self._leaders.add(task)
+        _MERGE_TASK.set(task)
+        task.add_done_callback(self._leaders.discard)
         self.pending[key] = window
         thinking = bool(self.config.get("enable_thinking", True))
         await self._hold_window(key, event, window, thinking)
@@ -1368,9 +1441,8 @@ class ReplyMergePlugin(Star):
         if (
             window.first_message
             or window.buffer
-            or window.images
+            or window.leader_images
             or window.earlier
-            or window.earlier_images
         ):
             self.orphaned.setdefault(key, []).append((time.monotonic(), window))
         # Hand the finished window to on_llm_request, which runs once the
@@ -1421,10 +1493,22 @@ class ReplyMergePlugin(Star):
             # awaits the conversation/persona stores, and a cancellation
             # landing there must still run the finally below instead of
             # leaving the key registered with no leader to answer it.
-            style_context = await self._style_context(event) if thinking else ""
+            style_context = ""
+            if thinking and not self._closing:
+                budget = min(THINK_CALL_TIMEOUT, window.hard_cap - time.monotonic())
+                if budget > 0:
+                    try:
+                        style_context = await asyncio.wait_for(
+                            self._style_context(event), timeout=budget
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning("[merge] thought style lookup timed out")
             logger.info(f"[merge] leader opened a thinking window ({key})")
             while True:
                 now = time.monotonic()
+                if self._closing:
+                    window.close_reason = "shutdown"
+                    break
                 if now >= window.hard_cap:
                     # Never cut a burst mid-sentence: if the user's latest
                     # message has not had min_wait to be read yet, give it
@@ -1438,7 +1522,11 @@ class ReplyMergePlugin(Star):
                         window.hard_cap + min_wait,
                     )
                     if now < floor:
-                        await asyncio.sleep(floor - now)
+                        window.wakeup.clear()
+                        try:
+                            await asyncio.wait_for(window.wakeup.wait(), floor - now)
+                        except asyncio.TimeoutError:
+                            pass
                         continue
                     window.close_reason = "hard_cap"
                     break
@@ -1499,17 +1587,34 @@ class ReplyMergePlugin(Star):
                 # fast burst, final at the deadline: let a rapid burst
                 # settle, then reason over all messages seen so far (chain:
                 # previous thought in).
-                await asyncio.sleep(THINK_SETTLE_SECONDS)
-                now = time.monotonic()
-                try:
-                    verdict = await self._think(
-                        event,
-                        window.first_message,
-                        window,
-                        elapsed=now - window.started_at,
-                        remaining=window.hard_cap - now,
-                        style_context=style_context,
+                await asyncio.sleep(
+                    min(
+                        THINK_SETTLE_SECONDS,
+                        max(0.0, window.hard_cap - time.monotonic()),
                     )
+                )
+                now = time.monotonic()
+                if self._closing or now >= window.hard_cap:
+                    continue
+                # Conservatively consume only donations present before the
+                # call. Donations arriving during context/queue/model awaits
+                # remain unread and get a final pass at the quiet deadline.
+                read_unseen = window.unseen
+                try:
+                    verdict = await asyncio.wait_for(
+                        self._think(
+                            event,
+                            window.first_message,
+                            window,
+                            elapsed=now - window.started_at,
+                            remaining=window.hard_cap - now,
+                            style_context=style_context,
+                        ),
+                        timeout=min(THINK_CALL_TIMEOUT, window.hard_cap - now),
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("[merge] thought budget exhausted; random quiet")
+                    verdict = None
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -1536,7 +1641,7 @@ class ReplyMergePlugin(Star):
                     window.thoughts.append(verdict)
                     # A failed pass keeps unseen, so the retry at the next
                     # deadline still reads the messages it missed.
-                    window.unseen = 0
+                    window.unseen = max(0, window.unseen - read_unseen)
                     brief = verdict.summary or " ".join(verdict.thought.split())[:60]
                     logger.info(
                         f"[merge] thought pass {passes}: "
@@ -1564,11 +1669,11 @@ class ReplyMergePlugin(Star):
             if (
                 window.first_message
                 or window.buffer
-                or window.images
+                or window.leader_images
                 or window.earlier
-                or window.earlier_images
             ):
                 self.orphaned.setdefault(key, []).append((time.monotonic(), window))
+            event.stop_event()
             raise
         except Exception:
             # A dirty config or an unexpected error must close the window,
@@ -1601,9 +1706,7 @@ class ReplyMergePlugin(Star):
             if not self._debounce_enabled(event):
                 return
             # Third-party agent runners never fire the waiting hook, so
-            # this one is their only chance to debounce. It runs under the
-            # session lock like before, which is worse for bursts but keeps
-            # the feature working for them.
+            # this one is their only chance to debounce.
             key = merge_key(event)
             existing = self.pending.get(key)
             if existing is not None:
@@ -1626,6 +1729,10 @@ class ReplyMergePlugin(Star):
                 leader_order=self._arrival_key(event),
                 leader_images=self._extract_attachments(event)[0],
             )
+            task = asyncio.current_task()
+            self._leaders.add(task)
+            _MERGE_TASK.set(task)
+            task.add_done_callback(self._leaders.discard)
             self.pending[key] = window
             await self._hold_window(
                 key,
@@ -1654,28 +1761,33 @@ class ReplyMergePlugin(Star):
         # Track this request as in-flight so a window opened while it
         # generates can blank its reply. The extra survives into the
         # response hook and names which window this response belongs to.
-        # Stale marking itself only happens in the waiting hook, so the
-        # third-party fallback below never discards: its requests queue on
-        # the session lock, and nothing of this session is in flight by
-        # the time one of them runs.
+        # Stale marking only happens in the local runner's waiting hook;
+        # third-party runners use merge_tail only and do not mark stale turns.
         self.inflight[key] = (window, time.monotonic())
         event.set_extra("_reply_merge_from_window", window)
 
         try:
             before, after = window.ordered_messages()
-            ordered_buffer = before + [line for message in after for line in message]
+            before_lines = [line for message in before for line in message.lines]
+            earlier_lines = [
+                line for message in window.earlier for line in message.lines
+            ]
+            ordered_buffer = before_lines + [
+                line for message in after for line in message.lines
+            ]
             merged_chars = (
                 len(window.first_message)
-                + sum(len(line) for line in window.earlier)
+                + sum(len(line) for line in earlier_lines)
                 + sum(len(line) for line in ordered_buffer)
             )
             # Archive the finished chain for the show_thoughts command
             # before req.prompt gets the merge blocks appended below.
             self.last_chain[key] = {
                 "time": time.strftime("%m-%d %H:%M:%S"),
-                "messages": [entry.lstrip("- ").strip() for entry in window.earlier]
-                + [window.first_message]
-                + [entry.lstrip("- ").strip() for entry in ordered_buffer],
+                "messages": [
+                    "\n".join(message.lines).removeprefix("- ").strip()
+                    for message in window.all_messages()
+                ],
                 "thoughts": [
                     {
                         "points": v.points,
@@ -1745,14 +1857,23 @@ class ReplyMergePlugin(Star):
                 last_thought = format_thought(thought)
                 if last_thought:
                     break
-            thought_block = f"{thought_marker}\n{last_thought}" if last_thought else ""
-            earlier_block = (
-                f"{earlier_marker}\n" + "\n".join(window.earlier)
-                if window.earlier
+            thought_block = (
+                f"[reply_merge:thought:{window.nonce}]\n"
+                f"{thought_marker}\n{last_thought}\n"
+                f"[/reply_merge:thought:{window.nonce}]"
+                if last_thought
                 else ""
             )
-            before_block = f"{before_marker}\n" + "\n".join(before) if before else ""
+            earlier_block = (
+                f"{earlier_marker}\n" + "\n".join(earlier_lines)
+                if earlier_lines
+                else ""
+            )
+            before_block = (
+                f"{before_marker}\n" + "\n".join(before_lines) if before_lines else ""
+            )
             after_block = ""
+            shown: list[BufferedMessage] = []
             if after:
                 # Dirty config may hold a non-numeric max_followups; fall
                 # back to the default instead of crashing the merge tail.
@@ -1767,9 +1888,11 @@ class ReplyMergePlugin(Star):
                     # oldest: what the user just said matters most to the
                     # reply, and whole messages are dropped, never half of
                     # one.
-                    shown.insert(0, [f"- ……（前面还有 {omitted} 条未展开）"])
-                after_block = f"{followup_marker}\n" + "\n".join(
-                    line for message in shown for line in message
+                    after_block = f"- ……（前面还有 {omitted} 条未展开）\n"
+                after_block = (
+                    f"{followup_marker}\n"
+                    + after_block
+                    + "\n".join(line for message in shown for line in message.lines)
                 )
                 logger.info(f"[merge] merged {len(after)} follow-ups ({key})")
             leader_text = (req.prompt or "").strip()
@@ -1795,18 +1918,19 @@ class ReplyMergePlugin(Star):
                 )
                 if tail:
                     req.prompt = f"{leader_text}\n\n{tail}"
-            forwarded_images = window.earlier_images + window.images
-            if self.config.get("forward_images", True) and forwarded_images:
-                # Allow a couple of images per merged message; one sticker
-                # burst often carries several, and cutting by message count
-                # drops them.
-                if req.image_urls is None:
-                    req.image_urls = []
-                try:
-                    limit = max(1, int(self.config.get("max_followups", 10)))
-                except (TypeError, ValueError):
-                    limit = 10
-                req.image_urls.extend(forwarded_images[: limit * 2])
+            if self.config.get("forward_images", True):
+                # Select whole messages before collecting their images. Earlier
+                # donations precede the leader's host-prepared image references.
+                preceding = sorted(
+                    [*window.earlier, *before], key=lambda message: message.order
+                )
+                req.image_urls = list(
+                    dict.fromkeys(
+                        [image for message in preceding for image in message.images]
+                        + list(req.image_urls or [])
+                        + [image for message in shown for image in message.images]
+                    )
+                )
         except Exception:
             logger.exception("[merge] merge tail failed; replying without merge blocks")
 
