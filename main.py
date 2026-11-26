@@ -39,8 +39,8 @@ Window lifecycle (per merge key = unified_msg_origin:sender_id):
   window; waiting under on_llm_request instead held the lock for the
   whole window and serialized the burst into separate slow replies, in
   which an older message's answer could land after a newer one's.
-- Messages arriving while the window is open are stopped at the event
-  handler stage; their text/images are donated to the window and the
+- Messages arriving while the window is open are donated after other
+  message handlers run. Their default LLM reply is suppressed and the
   leader is woken up. Evaluation is lazy: a few stray follow-ups only
   re-arm the reading floor, and the leader thinks once more when the
   quiet deadline expires (a burst past THINK_EAGER_MESSAGES is judged
@@ -48,12 +48,10 @@ Window lifecycle (per merge key = unified_msg_origin:sender_id):
 - The loop exits when the verdict-armed deadline passes with no new
   messages, the verdict says reply, or the hard cap (window start +
   max_window) is reached. The finished window rides on the event into
-  on_llm_request, where the thought block and the donated follow-ups are
-  appended to the prompt right before the persona call.
-- A window opened while the previous request is still generating marks
-  that reply stale; the on_llm_response hook blanks it so the newer
-  window's reply is the only answer. Chats listed in the scope config
-  skip all of this entirely.
+  on_llm_request, where follow-ups are added to the prompt and the local
+  runner gets the thought block as temporary model input.
+- A newer window can supersede an in-flight text reply from the local
+  runner. Tool-enabled, streaming and live replies run to completion.
 """
 
 from __future__ import annotations
@@ -73,6 +71,7 @@ from astrbot.api.message_components import At, File, Forward, Image, Record, Vid
 from astrbot.api.platform import MessageType
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
+from astrbot.core.agent.message import TextPart
 
 QUESTION_POLICY = (
     "同一问题首次提问后最多补问一次，换措辞、隔夜或重启不重置。"
@@ -158,7 +157,7 @@ THINK_EAGER_MESSAGES = 3
 # window to random quiet at once; queued passes wait at most one call
 # timeout and then degrade alone.
 THINK_MAX_CONCURRENT = 3
-# A merged request is tracked as in-flight from merge_tail until its
+# An eligible merged request is tracked from finalize_request until its
 # response hook fires. A request that dies without a response (provider
 # failure) never fires the hook, so an entry older than this is treated as
 # dead instead of poisoning the next window's stale-reply discard.
@@ -192,11 +191,9 @@ THINK_CONTEXT_CHARS = 400
 # monologue itself stays one or two lines either way.
 THINK_LONG_CONTENT_CHARS = 150
 # Grace period before a parked window's follow-ups may be moved into a
-# newer window. merge_tail normally claims a window milliseconds after it
-# closes; only a request that died in between (provider selection failure,
-# another hook stopping the event) or one still queued for the session
-# lock stays parked. The content is moved, not copied, so a request that
-# does reach merge_tail later cannot answer the same messages twice.
+# newer window. The final request hook normally claims a window shortly
+# after it closes. Provider selection failures, intervening hooks and
+# requests queued behind the session lock can keep a window parked.
 ORPHAN_GRACE_SECONDS = 5.0
 # Parked windows older than this are dropped when the next window opens,
 # bounding memory for chats that never come back.
@@ -546,7 +543,7 @@ class ReplyMergePlugin(Star):
         # merge_key -> MergeWindow, present only while a leader is waiting.
         self.pending: dict[str, MergeWindow] = {}
         # merge_key -> (MergeWindow, armed_at) for requests that left
-        # merge_tail and are generating; lets a newer window drop the
+        # finalize_request and are generating; lets a newer window drop the
         # stale reply instead of sending two answers back to back.
         self.inflight: dict[str, tuple[MergeWindow, float]] = {}
         # merge_key -> in-flight windows whose replies must be blanked
@@ -557,7 +554,7 @@ class ReplyMergePlugin(Star):
         # once; see THINK_MAX_CONCURRENT.
         self._think_gate = asyncio.Semaphore(THINK_MAX_CONCURRENT)
         # merge_key -> [(closed_at, window)] for windows that closed but were
-        # never claimed by merge_tail; older entries may be rescued.
+        # never claimed by finalize_request; older entries may be rescued.
         self.orphaned: dict[str, list[tuple[float, MergeWindow]]] = {}
         # merge_key -> latest finished chain, kept for the show_thoughts
         # command; bounded so a long-running bot does not grow it forever.
@@ -937,10 +934,38 @@ class ReplyMergePlugin(Star):
             event: Incoming message event.
 
         Returns:
-            False when the chat type is out of usage_scope, or the session
-            or the sender is blacklisted.
+            True for an ordinary user message in an enabled session.
         """
-        if self._closing:
+        if self._closing or event.is_stopped():
+            return False
+        if event.get_message_type() == MessageType.OTHER_MESSAGE:
+            return False
+        if event.get_extra("provider_request") is not None:
+            return False
+        envelope = event.get_extra("w1_event")
+        if isinstance(envelope, dict) and envelope.get("is_user_message") is False:
+            return False
+        if any(
+            event.get_extra(name)
+            for name in (
+                "codex_bridge",
+                "play_together",
+                "play_together_handled",
+                "self_amusement",
+                "self_cognition",
+            )
+        ):
+            return False
+        message_id = str(getattr(event.message_obj, "message_id", "") or "")
+        if event.get_platform_name() == "cron" or message_id.startswith(
+            ("proactive:", "codex-job:", "codex-report:")
+        ):
+            return False
+        if any(
+            type(item).__name__ in ("CommandFilter", "CommandGroupFilter", "RegexFilter")
+            for handler in event.get_extra("activated_handlers") or []
+            for item in getattr(handler, "event_filters", ()) or ()
+        ):
             return False
         scope = str(self.config.get("usage_scope", "both") or "both").strip().lower()
         try:
@@ -1320,25 +1345,22 @@ class ReplyMergePlugin(Star):
         window.think_images_seen.update(think_images)
         return Verdict(points, summary, questions, action, wait, thought)
 
-    @filter.event_message_type(filter.EventMessageType.ALL)
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=-1100)
     async def collect_followup(self, event: AstrMessageEvent) -> None:
         """Fold messages that arrive inside an open window into it.
 
         A follow-up does not have to be a wake command: in a group the user
         usually keeps typing without @-ing the bot again, and those messages
-        belong to the same burst. A wake command is stopped so the pipeline
-        never builds a second reply; a plain message is donated but left
-        running, because it cannot trigger an LLM request on its own and other
-        plugins may still want to see it.
+        belong to the same burst. Let message handlers run first and suppress
+        only the default LLM reply on a donated message.
 
         Args:
             event: Incoming message event.
         """
         if not self._debounce_enabled(event):
             return
-        # Platform notices (member joined, recalled, etc.) are not part of
-        # the user's burst.
-        if event.get_message_type() == MessageType.OTHER_MESSAGE:
+        # Another handler already claimed the default LLM route.
+        if getattr(event, "call_llm", False):
             return
         if not event.is_at_or_wake_command and any(
             isinstance(component, At) for component in event.get_messages()
@@ -1346,15 +1368,6 @@ class ReplyMergePlugin(Star):
             # Addressed to another member or bot: a side conversation, not a
             # continuation of the burst this window is holding.
             return
-        # A slash command must run instead of being folded into the window:
-        # swallowing it would drop the command's own output and feed its
-        # text to the persona as ordinary chat content.
-        for handler in event.get_extra("activated_handlers") or []:
-            if any(
-                type(f).__name__ in ("CommandFilter", "CommandGroupFilter")
-                for f in getattr(handler, "event_filters", ()) or ()
-            ):
-                return
         window = self.pending.get(merge_key(event))
         if window is None:
             return
@@ -1373,9 +1386,8 @@ class ReplyMergePlugin(Star):
             *self._extract_attachments(event),
         )
         if event.is_at_or_wake_command:
-            # Only a wake command would build a reply of its own; plain
-            # messages keep flowing to the other plugins.
-            event.stop_event()
+            # AstrBot's call_llm flag means the plugin claimed the default route.
+            event.should_call_llm(True)
 
     @filter.on_waiting_llm_request()
     async def hold_window(self, event: AstrMessageEvent) -> None:
@@ -1428,15 +1440,15 @@ class ReplyMergePlugin(Star):
             leader_images=self._extract_attachments(event)[0],
         )
         # Fold back messages a leader swallowed but never got to answer.
-        # A leader can die between this hook and merge_tail (provider
+        # A leader can die before the final request hook (provider
         # selection failure, another hook stopping the event), which would
         # silently drop its own message along with everything its window
         # collected. Entries younger than the grace period stay parked:
-        # their merge_tail is probably about to run. Older entries are
+        # their request hooks are probably about to run. Older entries are
         # moved here — and emptied there — so the messages are answered
         # exactly once even if that request is only queued behind the
         # session lock and still alive: the emptied window is marked
-        # rescued, and merge_tail skips a rescued window instead of
+        # rescued, and the request hooks skip it instead of
         # answering the same messages a second time.
         now = time.monotonic()
         still_waiting: list[tuple[float, MergeWindow]] = []
@@ -1493,7 +1505,7 @@ class ReplyMergePlugin(Star):
         thinking = bool(self.config.get("enable_thinking", True))
         await self._hold_window(key, event, window, thinking)
 
-        # Park the window until merge_tail claims it. A request that dies
+        # Park the window until finalize_request claims it. A request that dies
         # in between (no provider, another hook stopping the event) would
         # otherwise drop the leader's own message along with every
         # follow-up the window swallowed.
@@ -1744,7 +1756,8 @@ class ReplyMergePlugin(Star):
             # Always close the window, even if the leader is cancelled.
             self.pending.pop(key, None)
 
-    @filter.on_llm_request()
+    # Mood's time hook (10000) fingerprints the prompt to find it in history.
+    @filter.on_llm_request(priority=10100)
     async def merge_tail(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
         """Append the finished window's thought block and follow-ups.
 
@@ -1810,21 +1823,6 @@ class ReplyMergePlugin(Star):
             logger.info(f"[merge] skipping reply superseded by a newer window ({key})")
             event.stop_event()
             return
-        # This request is alive and will answer the window's messages, so
-        # the parked copy must not be resurrected into a later window.
-        parked = [
-            (ts, old) for ts, old in self.orphaned.get(key, []) if old is not window
-        ]
-        if parked:
-            self.orphaned[key] = parked
-        else:
-            self.orphaned.pop(key, None)
-        # Track this request as in-flight so a window opened while it
-        # generates can blank its reply. The extra survives into the
-        # response hook and names which window this response belongs to.
-        # Stale marking only happens in the local runner's waiting hook;
-        # third-party runners use merge_tail only and do not mark stale turns.
-        self.inflight[key] = (window, time.monotonic())
         event.set_extra("_reply_merge_from_window", window)
 
         try:
@@ -1925,6 +1923,19 @@ class ReplyMergePlugin(Star):
                 if last_thought
                 else ""
             )
+            if self._is_local_runner(event):
+                # Mood and memory hooks read req.prompt as human dialogue.
+                # Keep the draft available to the model in a transient part.
+                guidance = "\n\n".join(
+                    block for block in (cap_note, thought_block) if block
+                )
+                if guidance:
+                    if req.extra_user_content_parts is None:
+                        req.extra_user_content_parts = []
+                    req.extra_user_content_parts.append(
+                        TextPart(text=guidance).mark_as_temp()
+                    )
+                    cap_note = thought_block = ""
             earlier_block = (
                 f"{earlier_marker}\n" + "\n".join(earlier_lines)
                 if earlier_lines
@@ -1995,7 +2006,39 @@ class ReplyMergePlugin(Star):
         except Exception:
             logger.exception("[merge] merge tail failed; replying without merge blocks")
 
-    @filter.on_llm_response()
+    @filter.on_llm_request(priority=-1100)
+    async def finalize_request(
+        self, event: AstrMessageEvent, req: ProviderRequest
+    ) -> None:
+        """Claim the window and check whether the assembled request can be superseded."""
+        window = event.get_extra("_reply_merge_from_window")
+        if not isinstance(window, MergeWindow):
+            return
+        # Other hooks can stop the event or await while a new window rescues
+        # these messages. Keep the parked copy through those request hooks.
+        if window.rescued:
+            event.stop_event()
+            return
+        key = merge_key(event)
+        parked = [
+            (ts, old) for ts, old in self.orphaned.get(key, []) if old is not window
+        ]
+        if parked:
+            self.orphaned[key] = parked
+        else:
+            self.orphaned.pop(key, None)
+        if req.func_tool or not self.config.get("discard_inflight", True):
+            return
+        if not self._is_local_runner(event) or event.get_extra("action_type") == "live":
+            return
+        streaming = event.get_extra("enable_streaming")
+        if streaming is None and self.context is not None:
+            config = self.context.get_config(umo=event.unified_msg_origin)
+            streaming = (config.get("provider_settings") or {}).get("streaming_response")
+        if not streaming:
+            self.inflight[key] = (window, time.monotonic())
+
+    @filter.on_llm_response(priority=1000)
     async def drop_stale_reply(
         self, event: AstrMessageEvent, resp: LLMResponse
     ) -> None:
@@ -2004,9 +2047,7 @@ class ReplyMergePlugin(Star):
         The host fires this after the model answered and before anything
         goes out; an empty completion makes it skip both the send and the
         history record, so the stale answer simply never appears. The
-        newer window carries the stale burst's content in its own prompt
-        (copied when it was marked), so nothing goes unanswered. Streaming
-        replies cannot be retracted this way — turn the option off there.
+        newer window carries the stale burst's content in its own prompt.
 
         Args:
             event: The request's event, carrying the window marker set by

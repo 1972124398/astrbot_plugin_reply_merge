@@ -66,6 +66,19 @@ def install_stubs() -> None:
     provider.ProviderRequest = type("ProviderRequest", (), {})
     provider.LLMResponse = type("LLMResponse", (), {})
 
+    agent_message = types.ModuleType("astrbot.core.agent.message")
+
+    class TextPart:
+        def __init__(self, text):
+            self.text = text
+            self.temporary = False
+
+        def mark_as_temp(self):
+            self.temporary = True
+            return self
+
+    agent_message.TextPart = TextPart
+
     star = types.ModuleType("astrbot.api.star")
     star.Context = type("Context", (), {})
 
@@ -77,7 +90,7 @@ def install_stubs() -> None:
 
     pkg.api = api
     sys.modules["astrbot"] = pkg
-    for mod in (api, event, comps, platform, provider, star):
+    for mod in (api, event, comps, platform, provider, agent_message, star):
         sys.modules[mod.__name__] = mod
 
 
@@ -108,6 +121,7 @@ class FakeEvent:
         self._text = text
         self._images = list(images)
         self._stopped = False
+        self.call_llm = False
         self.is_at_or_wake_command = wake
         self.message_obj = types.SimpleNamespace(
             session_id=umo.split(":")[-1], timestamp=order
@@ -125,6 +139,12 @@ class FakeEvent:
 
     def get_message_type(self):
         return "group_message"
+
+    def get_platform_name(self):
+        return self.unified_msg_origin.split(":", 1)[0]
+
+    def should_call_llm(self, call_llm):
+        self.call_llm = call_llm
 
     def get_result(self):
         return None
@@ -444,7 +464,9 @@ def request(prompt="hello", images=()):
     Returns:
         An independent request double.
     """
-    return types.SimpleNamespace(prompt=prompt, image_urls=list(images))
+    return types.SimpleNamespace(
+        prompt=prompt, image_urls=list(images), extra_user_content_parts=[], func_tool=None
+    )
 
 
 async def test_real_think_unseen(m):
@@ -619,8 +641,11 @@ async def test_history_cleanup(m):
     event.set_extra("_reply_merge_window", window)
     req = request("current leader")
     await plugin.merge_tail(event, req)
-    assert f"[reply_merge:thought:{window.nonce}]\n" in req.prompt
-    assert f"\n[/reply_merge:thought:{window.nonce}]" in req.prompt
+    (draft,) = req.extra_user_content_parts
+    assert draft.temporary
+    assert f"[reply_merge:thought:{window.nonce}]\n" in draft.text
+    assert f"\n[/reply_merge:thought:{window.nonce}]" in draft.text
+    assert "PRIVATE_NEW_THOUGHT" not in req.prompt
     old_header = (
         "[以下是你在回复前对这位用户这句话的内心思考（校验码 deadbeef），帮助理解]\n"
         "PRIVATE_OLD_THOUGHT"
@@ -860,6 +885,7 @@ async def test_terminate_drains_pipeline(m):
                 waiting_done.set()
                 async with session_gate:
                     await plugin.merge_tail(event, req)
+                    await plugin.finalize_request(event, req)
             else:
                 await plugin.merge_tail(event, req)
                 waiting_done.set()
@@ -878,7 +904,7 @@ async def test_terminate_drains_pipeline(m):
                 text="accepted followup", images=["followup-image"], order=2
             )
             await plugin.collect_followup(followup)
-            assert followup.is_stopped()
+            assert followup.call_llm and not followup.is_stopped()
             window = plugin.pending[key]
             management = asyncio.create_task(plugin.terminate())
             await asyncio.sleep(0)
@@ -900,7 +926,10 @@ async def test_terminate_drains_pipeline(m):
             assert "accepted followup" in req.prompt
             assert "late must remain independent" not in req.prompt
             assert req.image_urls == ["followup-image"]
-            assert plugin.inflight[key][0] is window
+            if runner == "local":
+                assert plugin.inflight[key][0] is window
+            else:
+                assert key not in plugin.inflight
             assert not management.done()
             allow_response.set()
             await asyncio.wait_for(leader, 1)
@@ -1001,6 +1030,7 @@ async def test_leader_cancel_and_unload_guard(m):
             await plugin.hold_window(event)
             req = request()
             await plugin.merge_tail(event, req)
+            await plugin.finalize_request(event, req)
             if child:
                 await asyncio.create_task(plugin.terminate())
             else:
@@ -1032,6 +1062,7 @@ async def test_cancel_management_request(m):
         queued.set()
         await finish.wait()
         await plugin.merge_tail(event, req)
+        await plugin.finalize_request(event, req)
         await plugin.drop_stale_reply(
             event, types.SimpleNamespace(completion_text="reply")
         )
@@ -1070,7 +1101,7 @@ async def test_unanswered_handoff(m):
     Args:
         m: Imported plugin module.
     """
-    for failure in ("cancelled", "provider-selection", "reload"):
+    for failure in ("cancelled", "provider-selection", "request-hook", "reload"):
         context = FakeContext()
         plugin = m.ReplyMergePlugin(context, {"enable_thinking": False})
         plugin._random_quiet = lambda: 0.02
@@ -1081,6 +1112,10 @@ async def test_unanswered_handoff(m):
 
         async def old_pipeline():
             await plugin.hold_window(event)
+            if failure == "request-hook":
+                await plugin.merge_tail(event, request("unanswered leader"))
+                event.stop_event()
+                return
             raise RuntimeError("Simulated host provider-selection failure")
 
         leader = asyncio.create_task(old_pipeline())
@@ -1096,10 +1131,13 @@ async def test_unanswered_handoff(m):
         if failure == "cancelled":
             leader.cancel()
         result = await asyncio.gather(leader, return_exceptions=True)
-        assert isinstance(
-            result[0],
-            asyncio.CancelledError if failure == "cancelled" else RuntimeError,
-        )
+        if failure == "request-hook":
+            assert event.is_stopped() and result == [None]
+        else:
+            assert isinstance(
+                result[0],
+                asyncio.CancelledError if failure == "cancelled" else RuntimeError,
+            )
         assert len(plugin.orphaned[key]) == 1
         now = time.monotonic()
         old = plugin.orphaned[key][0][1]
@@ -1131,6 +1169,7 @@ async def test_unanswered_handoff(m):
         async def new_pipeline(current_event, current_req):
             await replacement.hold_window(current_event)
             await replacement.merge_tail(current_event, current_req)
+            await replacement.finalize_request(current_event, current_req)
             await replacement.drop_stale_reply(
                 current_event, types.SimpleNamespace(completion_text="rescued response")
             )
@@ -1174,6 +1213,7 @@ async def run_async_regressions(m):
     m.THINK_REPLY_PAUSE = 0.001
     try:
         await test_fresh_history_boundary(m)
+        await test_peer_event_and_request_interop(m)
         await test_real_think_unseen(m)
         await test_hard_cap_budget(m)
         await test_history_cleanup(m)
@@ -1190,6 +1230,61 @@ async def run_async_regressions(m):
     finally:
         m.THINK_SETTLE_SECONDS = settle
         m.THINK_REPLY_PAUSE = pause
+
+
+async def test_peer_event_and_request_interop(m):
+    context = FakeContext()
+    plugin = m.ReplyMergePlugin(context, {})
+    leader = FakeEvent(text="leader")
+    key = m.merge_key(leader)
+    window = m.MergeWindow(1, 10, first_message="leader")
+    plugin.pending[key] = window
+
+    for name, marker in (
+        ("w1_event", {"is_user_message": False}),
+        ("play_together_handled", True),
+        ("provider_request", request("plugin prompt")),
+        (
+            "activated_handlers",
+            [types.SimpleNamespace(event_filters=[type("RegexFilter", (), {})()])],
+        ),
+    ):
+        peer = FakeEvent()
+        peer.set_extra(name, marker)
+        await plugin.collect_followup(peer)
+        await plugin.hold_window(peer)
+        assert not peer.call_llm and not peer.is_stopped() and not window.buffer
+        assert peer.get_extra("_reply_merge_window") is None
+
+    already_claimed = FakeEvent()
+    already_claimed.should_call_llm(True)
+    await plugin.collect_followup(already_claimed)
+    assert not window.buffer
+    followup = FakeEvent(text="sticker context", images=["sticker.png"])
+    await plugin.collect_followup(followup)
+    assert followup.call_llm and not followup.is_stopped()
+    leader.set_extra("_reply_merge_window", window)
+    req = request("leader")
+    await plugin.merge_tail(leader, req)
+    assert "sticker context" in req.prompt and req.image_urls == ["sticker.png"]
+
+    # The final tool list can be supplied by a request hook after merge_tail.
+    req.func_tool = ["w1_delegate_to_codex"]
+    await plugin.finalize_request(leader, req)
+    assert key not in plugin.inflight
+    req.func_tool = None
+    leader.set_extra("enable_streaming", True)
+    await plugin.finalize_request(leader, req)
+    assert key not in plugin.inflight
+    leader.set_extra("enable_streaming", False)
+    leader.set_extra("action_type", "live")
+    await plugin.finalize_request(leader, req)
+    assert key not in plugin.inflight
+    leader.set_extra("action_type", None)
+    await plugin.finalize_request(leader, req)
+    assert plugin.inflight[key][0] is window
+    await plugin.terminate()
+    print("peer event routing, merged images and protected replies OK")
 
 
 async def test_fresh_history_boundary(m):

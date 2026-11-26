@@ -64,7 +64,7 @@
 | usage_scope | both | 生效范围：both=全部、group=仅群聊、private=仅私聊 |
 | disabled_sessions | （空） | 不启用防抖的会话名单（形如 `aiocqhttp:GroupMessage:123456` 的完整标识或纯数字会话 ID），名单内如同未安装本插件 |
 | disabled_users | （空） | 不启用防抖的用户名单（QQ 号/平台 ID） |
-| discard_inflight | true | 机器人回复生成中又收到新消息时，作废被取代的旧回复、只回一条；流式回复下无法收回已流出分段，请关闭 |
+| discard_inflight | true | 本地 Agent 生成无工具的非流式回复期间若收到新消息，可作废旧回复并把原消息带入新窗口 |
 
 ## 安装
 
@@ -87,6 +87,9 @@
 ## 适配说明
 
 - 适配 AstrBot v4.x（依赖 `on_waiting_llm_request`、`on_llm_request`、`on_llm_response` 钩子与 Provider `text_chat` 接口）
+- 消息监听器先处理原始事件。命令、游戏专用输入、Codex Bridge 通知、定时或主动事件、插件自建的模型请求走各自的处理链。
+- 微信表情包插件可以先补全引用内容，再由防抖窗口一起合并文字和图片。短期情绪插件的对话边界和自娱自乐插件读取合并后的正文。本地 Agent 将思考草稿作为临时内容交给模型，聊天历史保存正文。
+- 配有模型工具或启用流式回复的会话仍会合并等待窗口内的消息。在途回复完整交给 AstrBot 处理，以保留工具回执和已经开始发送的内容。
 - 防抖等待发生在会话 LLM 锁之外：一次连发不会被拆成多条按锁排队、彼此穿插的回复
 - 平台无关：aiocqhttp（QQ/NapCat）、微信等全平台消息源均可使用
 
