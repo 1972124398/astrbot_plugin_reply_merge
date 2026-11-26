@@ -1173,6 +1173,7 @@ async def run_async_regressions(m):
     m.THINK_SETTLE_SECONDS = 0.001
     m.THINK_REPLY_PAUSE = 0.001
     try:
+        await test_fresh_history_boundary(m)
         await test_real_think_unseen(m)
         await test_hard_cap_budget(m)
         await test_history_cleanup(m)
@@ -1189,6 +1190,30 @@ async def run_async_regressions(m):
     finally:
         m.THINK_SETTLE_SECONDS = settle
         m.THINK_REPLY_PAUSE = pause
+
+
+async def test_fresh_history_boundary(m):
+    plugin = m.ReplyMergePlugin(FakeContext(), {})
+    event = FakeEvent(umo="test:FriendMessage:alice", private=True)
+    history = [{"role": "user", "content": "旧问题"}, {"role": "assistant", "content": "追问"}]
+    now = time.time()
+    moment = {"last_user": now - 40000, "last_reply": now - 39900}
+    clocks = types.SimpleNamespace(sessions={event.unified_msg_origin: moment}, boundary=lambda *_: 2)
+    peer = types.SimpleNamespace(config={}, closing=False, clocks=clocks, number=lambda *_: 6)
+    plugin.context.get_registered_star = lambda _: types.SimpleNamespace(activated=True, star_cls=peer)
+    assert plugin._fresh_history(event, types.SimpleNamespace(), history) == []
+    assert moment["last_user"] == now - 40000  # A draft cannot reset the clock.
+    moment["last_reply"] = now - 1
+    fresh = history + [{"role": "user", "content": "今天想说的"}]
+    assert plugin._fresh_history(event, types.SimpleNamespace(), fresh) == fresh[2:]
+    plugin.context.get_registered_star = lambda _: None
+    assert plugin._fresh_history(event, types.SimpleNamespace(updated_at=now - 40000), history) == []
+    marked = "今天\n[reply_merge:thought:1234abcd]\n旧催问\n[/reply_merge:thought:1234abcd]"
+    original = [{"role": "user", "content": marked}]
+    assert m.without_saved_drafts(original) == [{"role": "user", "content": "今天"}]
+    assert original[0]["content"] == marked
+    await plugin.terminate()
+    print("fresh history boundary, standalone fallback and saved draft cleanup OK")
 
 
 def main() -> None:

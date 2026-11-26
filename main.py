@@ -74,6 +74,29 @@ from astrbot.api.platform import MessageType
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
 
+QUESTION_POLICY = (
+    "同一问题首次提问后最多补问一次，换措辞、隔夜或重启不重置。"
+    "仍无回应时判断重要性：不重要丢掉，重要只静默保留，等对方主动接续。"
+    "不要让旧追问、旧梗或想赢的心情压过眼前的新话；对方没有欠答。"
+)
+
+
+def without_saved_drafts(messages):
+    """Remove our old temporary drafts from history without altering user text."""
+    result = []
+    pattern = r"\[reply_merge:thought:([0-9a-f]{8})\]\n.*?\n\[/reply_merge:thought:\1\]"
+    for original in messages:
+        message = dict(original)
+        content = message.get("content")
+        if message.get("role") == "user":
+            if isinstance(content, str):
+                message["content"] = re.sub(pattern, "", content, flags=re.DOTALL).strip()
+            elif isinstance(content, list):
+                message["content"] = [dict(p, text=re.sub(pattern, "", p["text"], flags=re.DOTALL).strip())
+                                      if isinstance(p, dict) and isinstance(p.get("text"), str) else p for p in content]
+        result.append(message)
+    return result
+
 # Legacy structured prompt: asks for points/summary/questions. Still used
 # when think_voice is "structured" so an existing setup can be compared
 # against or rolled back to after the 1.4.0 voice change.
@@ -100,7 +123,7 @@ THINK_SYSTEM_PROMPT_HUMAN = (
     "- 对方的话再长也要先看到最后一个字再应；接哪里都行，"
     "就是别只接开头撞见的第一个词\n"
     "- 可以是吐槽、疑问、回忆、没反应过来；可以半句，可以停住，可以说一半改口\n"
-    "- 想起之前聊过的事就直接插进来\n"
+    "- 之前聊过的事仅在眼前话题确实相关时参考，不为续梗或追讨旧问题硬插进来\n"
     "- 分清是谁说的：对方说的、你自己说过的、群里别人说的，别记混\n"
     "- 如果这句是在接刚才的话，先在心里接上那件事，再想怎么应\n"
     "- 不用每条消息都想到，也不用每轮都从同一句开头\n"
@@ -786,6 +809,7 @@ class ReplyMergePlugin(Star):
             return ""
         if not isinstance(history, list):
             return ""
+        history = self._fresh_history(event, conversation, history)
         # A group conversation stores every member's messages in one stream
         # with no sender at all. Labelling all of them "对方" told the thought
         # that the whole transcript was the one person it is answering, so it
@@ -865,6 +889,40 @@ class ReplyMergePlugin(Star):
                 text = text[:THINK_CONTEXT_CHARS].rstrip() + "…"
             lines.append((others if role == "user" else "你") + "：" + text)
         return "\n".join(lines)
+
+    def _fresh_history(self, event, conversation, history):
+        """Use the mood plugin's real-exchange clock before any draft is made.
+
+        This is a read-only optional integration. It does not advance the clock
+        and thereby hide the real gap from the normal request hooks.
+        """
+        now = time.time()
+        try:
+            lookup = getattr(self.context, "get_registered_star", None)
+            star = lookup("astrbot_plugin_short_term_mood") if lookup else None
+            peer = getattr(star, "star_cls", None) if star and getattr(star, "activated", False) else None
+            if peer and not getattr(peer, "closing", False) and peer.config.get("enabled", True) and peer.config.get("time_awareness", True):
+                origin = str(event.unified_msg_origin)
+                # Private origins already are canonical. Group clocks collapse
+                # the sender component just like the companion v1 protocol.
+                parts = origin.split(":", 2)
+                if len(parts) == 3 and parts[1] == "GroupMessage":
+                    from urllib.parse import unquote
+                    session = parts[2].split("|")
+                    group = unquote(session[2]) if len(session) in (3, 4) and session[1] == "group" else parts[2]
+                    origin = parts[0] + ":group:" + group
+                moment = peer.clocks.sessions.get(origin)
+                if moment:
+                    previous = max(moment.get("last_user", 0), moment.get("last_reply", 0))
+                    if previous and now - previous >= peer.number("context_set_aside_hours", 6, 0.01, 720) * 3600:
+                        return []
+                    return history[peer.clocks.boundary(moment, history):]
+        except (AttributeError, TypeError, ValueError):
+            pass  # Optional older companion API; use the host timestamp below.
+        previous = getattr(conversation, "updated_at", None)
+        if isinstance(previous, (int, float)) and previous > 0 and now - previous >= 6 * 3600:
+            return []
+        return history
 
     def _debounce_enabled(self, event: AstrMessageEvent) -> bool:
         """Tell whether debounce applies to this chat at all.
@@ -1041,6 +1099,7 @@ class ReplyMergePlugin(Star):
             )
         else:
             system_prompt = THINK_SYSTEM_PROMPT_STRUCTURED
+        system_prompt += "\n" + QUESTION_POLICY
         try:
             provider_id = str(self.config.get("think_provider_id", "") or "").strip()
             provider = (
@@ -1699,6 +1758,8 @@ class ReplyMergePlugin(Star):
             event: Incoming message event.
             req: The provider request about to be sent.
         """
+        if isinstance(getattr(req, "contexts", None), list):
+            req.contexts = without_saved_drafts(req.contexts)
         window = event.get_extra("_reply_merge_window")
         if not isinstance(window, MergeWindow):
             if self._is_local_runner(event):
